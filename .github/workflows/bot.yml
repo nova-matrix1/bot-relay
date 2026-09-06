@@ -1,6 +1,9 @@
 name: Python Bot Relay Node
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       cycle_count:
