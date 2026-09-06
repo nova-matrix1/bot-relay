@@ -1,0 +1,240 @@
+name: Python Bot Relay Node
+
+on:
+  workflow_dispatch:
+    inputs:
+      cycle_count:
+        description: 'Relay cycle counter'
+        required: false
+        default: '0'
+        type: string
+      test_handover:
+        description: 'Test mode: hand over after X minutes (0 for normal 345m)'
+        required: false
+        default: '0'
+        type: string
+
+jobs:
+  bot-relay:
+    name: Run Python Telegram Forwarder & Bots
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout Current Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python Environment
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Clone Private Filessss Repository
+        env:
+          CLONE_PAT: ${{ secrets.CLONE_PAT }}
+        run: |
+          git config --global user.name "Silver-kun"
+          git config --global user.email "silver-kun@users.noreply.github.com"
+          git clone https://${CLONE_PAT}@github.com/Silver-kun/Filessss.git filessss
+          echo "Cloned Filessss folders:"
+          ls -la filessss/
+
+      - name: Predecessor Handshake & Conflict Prevention
+        env:
+          PREV_PAT: ${{ secrets.PREV_PAT }}
+          CYCLE_COUNT: ${{ github.event.inputs.cycle_count }}
+        run: |
+          REPOS=(
+            "nova-matrix1/bot-relay"
+            "silverdoesbusiness/bot-relay"
+            "ravii909934/bot-relay"
+            "orbit-devs12/bot-relay"
+          )
+          CURRENT_INDEX=-1
+          for i in "${!REPOS[@]}"; do
+            if [[ "${REPOS[$i]}" == "${GITHUB_REPOSITORY}" ]]; then
+              CURRENT_INDEX=$i
+              break
+            fi
+          done
+
+          if [ $CURRENT_INDEX -ge 0 ]; then
+            PREV_INDEX=$(( (CURRENT_INDEX - 1 + ${#REPOS[@]}) % ${#REPOS[@]} ))
+            PREV_REPO="${REPOS[$PREV_INDEX]}"
+            echo "Checking predecessor node: ${PREV_REPO}..."
+
+            PREV_RUN_ID=$(GH_TOKEN="$PREV_PAT" gh run list --repo "$PREV_REPO" --status in_progress --limit 1 --json databaseId -q '.[0].databaseId' 2>/dev/null || echo "")
+
+            if [ -n "$PREV_RUN_ID" ] && [ "$PREV_RUN_ID" != "null" ]; then
+              echo "Active predecessor run detected: #${PREV_RUN_ID} on ${PREV_REPO}"
+              echo "Gracefully cancelling predecessor to release Telegram sessions..."
+              GH_TOKEN="$PREV_PAT" gh run cancel "$PREV_RUN_ID" --repo "$PREV_REPO" 2>/dev/null || true
+
+              for sec in {1..15}; do
+                RUN_STATUS=$(GH_TOKEN="$PREV_PAT" gh run view "$PREV_RUN_ID" --repo "$PREV_REPO" --json status -q '.status' 2>/dev/null || echo "completed")
+                if [ "$RUN_STATUS" != "in_progress" ]; then
+                  echo "Predecessor terminated cleanly in ${sec}s."
+                  break
+                fi
+                sleep 2
+              done
+              sleep 3
+            else
+              echo "No active predecessor run detected on ${PREV_REPO}. Safe to proceed."
+            fi
+          fi
+
+      - name: Install Dependencies & SDKs
+        run: |
+          python -m pip install --upgrade pip
+          pip install firebase-admin
+          if [ -f filessss/telegram_forwarder/requirements.txt ]; then
+            echo "Installing requirements for telegram_forwarder..."
+            pip install -r filessss/telegram_forwarder/requirements.txt
+          fi
+
+      - name: Launch MasterBot Supervisor Daemon
+        env:
+          FIREBASE_KEY_B64: ${{ secrets.FIREBASE_KEY_B64 }}
+          CYCLE_COUNT: ${{ github.event.inputs.cycle_count }}
+        run: |
+          cd filessss/telegram_forwarder
+          echo "Starting daemon.py in background..."
+          python -u daemon.py > daemon.log 2>&1 &
+          DAEMON_PID=$!
+          echo $DAEMON_PID > /tmp/daemon.pid
+          echo "Launched MasterDaemon with PID $DAEMON_PID"
+
+          sleep 5
+          if kill -0 $DAEMON_PID 2>/dev/null; then
+            echo "MasterDaemon is running smoothly!"
+            head -n 20 daemon.log || true
+          else
+            echo "Warning: Daemon exited early. Log output:"
+            cat daemon.log
+            exit 1
+          fi
+
+      - name: Maintenance Loop & Automated Successor Handover
+        env:
+          NEXT_PAT: ${{ secrets.NEXT_PAT }}
+          FALLBACK_PAT: ${{ secrets.FALLBACK_PAT }}
+          CYCLE_COUNT: ${{ github.event.inputs.cycle_count }}
+          TEST_HANDOVER: ${{ github.event.inputs.test_handover }}
+        run: |
+          echo "==========================================================="
+          echo "  MasterBot Cloud Node Active: ${GITHUB_REPOSITORY} (Cycle: ${CYCLE_COUNT})"
+          echo "==========================================================="
+
+          HANDOVER_MINUTE=345
+          if [ -n "$TEST_HANDOVER" ] && [ "$TEST_HANDOVER" -gt 0 ] 2>/dev/null; then
+            echo ">>> TEST HANDOVER OVERRIDE: ${TEST_HANDOVER} minute(s) <<<"
+            HANDOVER_MINUTE=$TEST_HANDOVER
+          fi
+
+          ELAPSED=0
+          DAEMON_PID=$(cat /tmp/daemon.pid 2>/dev/null || echo "")
+
+          while [ $ELAPSED -lt $HANDOVER_MINUTE ]; do
+            sleep 60
+            ELAPSED=$((ELAPSED + 1))
+
+            # Auto-restart daemon if crashed
+            if [ -n "$DAEMON_PID" ] && ! kill -0 $DAEMON_PID 2>/dev/null; then
+              echo "[$(date +'%T')] Daemon died unexpectedly. Restarting..."
+              cd ${GITHUB_WORKSPACE}/filessss/telegram_forwarder
+              python -u daemon.py >> daemon.log 2>&1 &
+              DAEMON_PID=$!
+              echo $DAEMON_PID > /tmp/daemon.pid
+            fi
+
+            if [ $((ELAPSED % 15)) -eq 0 ] || [ $HANDOVER_MINUTE -le 10 ]; then
+              echo "[$(date +'%T')] Heartbeat: Elapsed ${ELAPSED}/${HANDOVER_MINUTE}m | Daemon PID $DAEMON_PID alive."
+            fi
+          done
+
+          echo "==========================================================="
+          echo "  HANDOVER THRESHOLD REACHED (Minute ${HANDOVER_MINUTE})"
+          echo "  Triggering next ring successor..."
+          echo "==========================================================="
+
+          REPOS=(
+            "nova-matrix1/bot-relay"
+            "silverdoesbusiness/bot-relay"
+            "ravii909934/bot-relay"
+            "orbit-devs12/bot-relay"
+          )
+
+          CURRENT_INDEX=-1
+          for i in "${!REPOS[@]}"; do
+            if [[ "${REPOS[$i]}" == "${GITHUB_REPOSITORY}" ]]; then
+              CURRENT_INDEX=$i
+              break
+            fi
+          done
+
+          NEXT_INDEX=$(( (CURRENT_INDEX + 1) % ${#REPOS[@]} ))
+          FALLBACK_INDEX=$(( (CURRENT_INDEX + 2) % ${#REPOS[@]} ))
+          PRIMARY_TARGET="${REPOS[$NEXT_INDEX]}"
+          FALLBACK_TARGET="${REPOS[$FALLBACK_INDEX]}"
+          NEXT_CYCLE=$((CYCLE_COUNT + 1))
+
+          dispatch_runner() {
+            local target="$1"
+            local token="$2"
+            for attempt in 1 2 3 4; do
+              echo "Dispatch attempt $attempt to ${target}..."
+              if GH_TOKEN="$token" gh workflow run bot.yml \
+                --repo "$target" \
+                -f cycle_count="$NEXT_CYCLE" \
+                -f test_handover="0"; then
+                echo "Successfully triggered workflow on ${target}."
+                return 0
+              fi
+              sleep 15
+            done
+            return 1
+          }
+
+          send_tg_alert() {
+            local msg="$1"
+            python -c "
+import urllib.request, urllib.parse, json
+token = '8666866491:AAHg4p-b3BC11Ko4lUslIlz1iBluGyfqYjQ'
+chat_id = '8512281477'
+text = '''$msg'''
+url = f'https://api.telegram.org/bot{token}/sendMessage'
+data = urllib.parse.urlencode({'chat_id': chat_id, 'text': text, 'parse_mode': 'HTML'}).encode()
+try:
+    urllib.request.urlopen(url, data=data, timeout=8)
+except Exception:
+    pass
+" 2>/dev/null || true
+          }
+
+          if dispatch_runner "$PRIMARY_TARGET" "$NEXT_PAT"; then
+            send_tg_alert "🔄 <b>[MasterBot Relay Handover]</b>%0ACycle: <code>#${NEXT_CYCLE}</code>%0AFrom: <code>${GITHUB_REPOSITORY}</code>%0ANext Active Node: <code>${PRIMARY_TARGET}</code> ✅"
+          else
+            echo "Primary dispatch to ${PRIMARY_TARGET} failed. Engaging fallback to ${FALLBACK_TARGET}..."
+            if dispatch_runner "$FALLBACK_TARGET" "$FALLBACK_PAT"; then
+              send_tg_alert "⚠️ <b>[MasterBot Fallback Handover]</b>%0ACycle: <code>#${NEXT_CYCLE}</code>%0APrimary Failed! Activated fallback: <code>${FALLBACK_TARGET}</code>"
+            else
+              send_tg_alert "🚨 <b>[CRITICAL RELAY FAILURE]</b>%0AAll successor dispatches failed on ${GITHUB_REPOSITORY}!"
+            fi
+          fi
+
+          echo "Successor triggered. Running until predecessor cancellation signal arrives..."
+          for wait_min in {1..10}; do
+            sleep 60
+            echo "[$(date +'%T')] Outgoing node active & serving (handoff wait +${wait_min}m)..."
+          done
+
+      - name: Final Teardown Safety Cleanup
+        if: always()
+        run: |
+          echo "Terminating MasterDaemon and child processes cleanly..."
+          PID=$(cat /tmp/daemon.pid 2>/dev/null || echo "")
+          if [ -n "$PID" ]; then
+            kill -15 $PID 2>/dev/null || true
+          fi
+          echo "Clean shutdown complete."
